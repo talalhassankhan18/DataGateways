@@ -20,7 +20,7 @@ The layout and motion follow [dtv.sa](https://dtv.sa), which the client supplied
 
 ## Quick start
 
-Requires **Node 20+**.
+Requires **Node 22.12+** — vitest 5 does not run on 20.
 
 ```bash
 npm install
