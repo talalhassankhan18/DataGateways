@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Lets a failing run be re-tried without an empty commit.
+  workflow_dispatch:
+
+# A second push to the same branch makes the first run irrelevant, so cancel it. Never on main,
+# where every commit's result is worth having.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Lint, typecheck, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Matches the `engines.node` floor in package.json.
+          node-version: 20
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      # The web and api workspaces both import @datagateways/shared as a built package, so its
+      # declaration output has to exist before anything else can typecheck.
+      - name: Build shared package
+        run: npm run build:shared
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      # The register is generated from the content modules, so a flagged value added without
+      # regenerating it would otherwise drift silently out of the docs.
+      - name: Check placeholder register is current
+        run: node scripts/generate-placeholders.mjs --check
+
+      - name: Upload production build
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: apps/web/dist
+          retention-days: 7
+          if-no-files-found: error
+
+  licences:
+    name: Every media file has a licence row
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # docs/licences.csv is the project's standing rule: no row, no ship. Enforced here so a file
+      # cannot be added to assets/ without its provenance being recorded alongside it.
+      - name: Compare assets/ against docs/licences.csv
+        run: |
+          status=0
+          while IFS= read -r file; do
+            case "$(basename "$file")" in README.md) continue ;; esac
+            if ! cut -d, -f1 docs/licences.csv | grep -qxF "$file"; then
+              echo "::error file=$file::No row in docs/licences.csv for $file"
+              status=1
+            fi
+          done < <(find assets -type f | sort)
+          if [ "$status" -eq 0 ]; then
+            echo "All $(find assets -type f ! -name README.md | wc -l) asset(s) accounted for."
+          fi
+          exit "$status"
