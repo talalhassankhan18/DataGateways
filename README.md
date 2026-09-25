@@ -8,8 +8,6 @@ Three products sit behind it — **DataNerve** (zero-trust pipeline encryption),
 (real-time AI prompt firewall) and **SOCMINT** (open-source exposure monitoring) — plus services,
 a partner programme and a branching contact wizard.
 
-The layout and motion follow [dtv.sa](https://dtv.sa), which the client supplied as a reference for
-**structure and motion only**. The brand, colour and copy are DataGateways'.
 
 > [!IMPORTANT]
 > **This is not ready to go public.** The site reads as finished, but several claims on it are
