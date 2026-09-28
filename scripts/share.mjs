@@ -181,28 +181,48 @@ const runShell = (command) =>
   });
 
 /*
- * Cloudflare first, because its URL opens straight onto the site with no interstitial.
+ * Cloudflare first, because its URL opens straight onto the site with no interstitial and no
+ * exposure of this machine's public IP.
  *
- * It registers a quick tunnel by POSTing to api.trycloudflare.com and gives up on a timeout
- * shorter than that request takes on a slow or filtered link — on the network this was built on
- * the POST reliably took ~26s and cloudflared always aborted. That is a network problem, not a
- * setup problem, so fall through rather than leaving a dead command.
+ * Retried, because the failure is intermittent rather than permanent. cloudflared registers a
+ * quick tunnel by POSTing to api.trycloudflare.com and abandons it on a fairly short timeout; on
+ * a congested link that POST sometimes takes longer than the timeout and sometimes does not. The
+ * same network has produced a 26s failure and a 5.8s success minutes apart, so giving up after
+ * one try drops people onto the uglier fallback for no good reason.
+ *
+ * Only registration is retried. Once a tunnel is up, `run` blocks until it exits, and an exit at
+ * that point means the user pressed Ctrl-C.
  *
  * `--edge-ip-version 4` and `--protocol http2` skip the two things that most often hang: an IPv6
  * route that goes nowhere, and QUIC on UDP 7844 being blocked.
  */
-const cloudflare = await run(binary, [
-  'tunnel',
-  '--no-autoupdate',
-  '--edge-ip-version',
-  '4',
-  '--protocol',
-  'http2',
-  '--url',
-  `http://localhost:${port}`,
-]);
+const CLOUDFLARE_ATTEMPTS = 3;
 
-if (cloudflare.code === 0) process.exit(0);
+let cloudflare = { code: 1, spawned: true };
+
+for (let attempt = 1; attempt <= CLOUDFLARE_ATTEMPTS; attempt += 1) {
+  if (attempt > 1) {
+    console.log(`share: Cloudflare registration timed out — retry ${attempt} of ${CLOUDFLARE_ATTEMPTS}.`);
+    console.log('');
+  }
+
+  cloudflare = await run(binary, [
+    'tunnel',
+    '--no-autoupdate',
+    '--edge-ip-version',
+    '4',
+    '--protocol',
+    'http2',
+    '--url',
+    `http://localhost:${port}`,
+  ]);
+
+  // A clean exit means the tunnel ran and the user stopped it. Nothing to retry.
+  if (cloudflare.code === 0) process.exit(0);
+
+  // A binary that will not start will not start on the third go either.
+  if (!cloudflare.spawned) break;
+}
 
 console.log('');
 
@@ -213,7 +233,7 @@ if (!cloudflare.spawned) {
   console.log(`       ${cloudflare.err?.message ?? 'spawn failed'}`);
   console.log('       Delete .tools/ and re-run to fetch it again.');
 } else {
-  console.log('share: Cloudflare would not open a tunnel from this network.');
+  console.log(`share: Cloudflare would not register a tunnel after ${CLOUDFLARE_ATTEMPTS} attempts.`);
 }
 
 console.log('');
