@@ -89,35 +89,109 @@ if (!exists) {
   if (process.platform !== 'win32') await chmod(binary, 0o755);
 }
 
+/*
+ * Look at what is actually on the port before opening anything.
+ *
+ * Both ways this has gone wrong in practice are visible from here and invisible once a tunnel is
+ * up. With nothing listening the tunnel opens happily and serves 502s, which reads as "the tunnel
+ * is broken". With the dev server listening it works, but Vite sends one request per source
+ * module — hundreds of round trips — and a page that takes ~45s to appear also reads as broken.
+ */
+const origin = `http://localhost:${port}`;
+const probe = await fetch(origin, { redirect: 'manual' })
+  .then(async (r) => ({ ok: true, body: await r.text().catch(() => '') }))
+  .catch(() => ({ ok: false, body: '' }));
+
+if (!probe.ok) {
+  console.error('');
+  console.error(`share: nothing is listening on ${origin}.`);
+  console.error('       A tunnel to a closed port opens fine and then serves 502 to everyone.');
+  console.error('');
+  console.error('       Start the site first, in another terminal:');
+  console.error('         npm run build && npm run preview');
+  console.error('');
+  process.exit(1);
+}
+
+const isDevServer = /@vite\/client|@react-refresh/.test(probe.body);
+
+if (isDevServer) {
+  console.warn('');
+  console.warn(`share: ${origin} is the DEV server, not the production build.`);
+  console.warn('       It will work, but Vite serves every source module as its own request, so');
+  console.warn('       the page takes tens of seconds to appear over a tunnel. Measured at ~45s.');
+  console.warn('');
+  console.warn('       For anyone you would not describe as patient, stop the dev server and run:');
+  console.warn('         npm run build && npm run preview');
+  console.warn('');
+  console.warn('       Continuing in 5s — Ctrl-C to stop.');
+  await new Promise((r) => setTimeout(r, 5000));
+}
+
 console.log('');
-console.log(`share: tunnelling http://localhost:${port} — the public URL appears below.`);
+console.log(`share: tunnelling ${origin} — the public URL appears below.`);
 console.log('share: the link is public and unauthenticated, and dies when you stop this (Ctrl-C).');
 console.log('');
 
-/** Runs a child to completion and resolves with its exit code. Ctrl-C is handed straight through. */
+/**
+ * Runs a child to completion and resolves with `{ code, spawned }`. Ctrl-C is handed straight
+ * through so the tunnel closes cleanly rather than being orphaned.
+ *
+ * `spawned` distinguishes "the program ran and failed" from "the program never started", which
+ * matters because the two want completely different messages. `error` fires for the second case.
+ *
+ * NO SHELL. This used to pass `shell: true` on Windows, which concatenates arguments into one
+ * string without escaping them — so a binary under "C:\...\Data Gateways\..." was split at the
+ * space and cmd tried to run "C:\Users\PMLS\Downloads\Data". Passing argv directly keeps spaces
+ * intact, and is also what clears Node's DEP0190 warning about exactly this hazard.
+ */
 const run = (cmd, args) =>
   new Promise((resolve) => {
-    const child = spawn(cmd, args, { stdio: 'inherit', shell: process.platform === 'win32' });
+    const child = spawn(cmd, args, { stdio: 'inherit' });
     const forward = (sig) => child.kill(sig);
     for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, forward);
     child.on('exit', (code, signal) => {
       for (const sig of ['SIGINT', 'SIGTERM']) process.off(sig, forward);
-      resolve(signal ? 1 : (code ?? 0));
+      resolve({ code: signal ? 1 : (code ?? 0), spawned: true });
     });
-    child.on('error', () => resolve(1));
+    child.on('error', (err) => {
+      for (const sig of ['SIGINT', 'SIGTERM']) process.off(sig, forward);
+      resolve({ code: 1, spawned: false, err });
+    });
+  });
+
+/**
+ * npx is a `.cmd` shim on Windows, and Node refuses to spawn one without a shell. So this is the
+ * one call that needs `shell: true` — and it passes a single pre-built command string rather than
+ * an argv array, because that is the form that does not silently mangle its arguments.
+ *
+ * Every value interpolated here is either a number or a literal from this file, so there is
+ * nothing user-supplied to quote.
+ */
+const runShell = (command) =>
+  new Promise((resolve) => {
+    const child = spawn(command, { stdio: 'inherit', shell: true });
+    const forward = (sig) => child.kill(sig);
+    for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, forward);
+    child.on('exit', (code, signal) => {
+      for (const sig of ['SIGINT', 'SIGTERM']) process.off(sig, forward);
+      resolve({ code: signal ? 1 : (code ?? 0), spawned: true });
+    });
+    child.on('error', () => resolve({ code: 1, spawned: false }));
   });
 
 /*
- * Cloudflare first, because its URL opens straight onto the site. It registers a quick tunnel by
- * POSTing to api.trycloudflare.com, and gives up on a timeout shorter than that request takes on a
- * slow or filtered connection — on the network this was built on the POST reliably took ~26s and
- * cloudflared always aborted. When that happens it is the network, not the setup, so fall through
- * rather than leaving the user with a dead command.
+ * Cloudflare first, because its URL opens straight onto the site with no interstitial.
+ *
+ * It registers a quick tunnel by POSTing to api.trycloudflare.com and gives up on a timeout
+ * shorter than that request takes on a slow or filtered link — on the network this was built on
+ * the POST reliably took ~26s and cloudflared always aborted. That is a network problem, not a
+ * setup problem, so fall through rather than leaving a dead command.
  *
  * `--edge-ip-version 4` and `--protocol http2` skip the two things that most often hang: an IPv6
  * route that goes nowhere, and QUIC on UDP 7844 being blocked.
  */
-const cloudflareExit = await run(binary, [
+const cloudflare = await run(binary, [
   'tunnel',
   '--no-autoupdate',
   '--edge-ip-version',
@@ -128,14 +202,27 @@ const cloudflareExit = await run(binary, [
   `http://localhost:${port}`,
 ]);
 
-if (cloudflareExit === 0) process.exit(0);
+if (cloudflare.code === 0) process.exit(0);
 
 console.log('');
-console.log('share: Cloudflare would not open a tunnel from this network — falling back to');
-console.log('       localtunnel. Note that it shows visitors a warning page first, and they have');
-console.log('       to type this machine\'s public IP to get past it. That IP is on the page.');
+
+// Say which of the two things went wrong. Reporting a network problem when the binary never
+// started sends whoever is debugging this straight past the actual cause.
+if (!cloudflare.spawned) {
+  console.log(`share: could not start cloudflared at ${binary}`);
+  console.log(`       ${cloudflare.err?.message ?? 'spawn failed'}`);
+  console.log('       Delete .tools/ and re-run to fetch it again.');
+} else {
+  console.log('share: Cloudflare would not open a tunnel from this network.');
+}
+
+console.log('');
+console.log('share: falling back to localtunnel. It shows visitors a warning page first, and they');
+console.log("       have to type this machine's public IP to get past it. That IP is on the page.");
 console.log('');
 
-process.exit(
-  await run('npx', ['--yes', 'localtunnel', '--port', String(port), '--subdomain', 'datagateways-preview']),
+const fallback = await runShell(
+  `npx --yes localtunnel --port ${port} --subdomain datagateways-preview`,
 );
+
+process.exit(fallback.code);
